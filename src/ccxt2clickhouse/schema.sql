@@ -3,6 +3,7 @@
 CREATE TABLE IF NOT EXISTS quotes
 (
     source LowCardinality(String) COMMENT 'Exchange name (binance, bybit, etc.)',
+    symbol LowCardinality(String) COMMENT 'Trading pair symbol (BTC/USDT, ETH/USDT, etc.)',
     timeframe LowCardinality(String) COMMENT 'Timeframe: 1s, 1m, 5m, 1h, 1d, 1w, etc.',
     time DateTime64(3) COMMENT 'Timestamp in milliseconds precision',
     open Float64 COMMENT 'Opening price',
@@ -13,12 +14,13 @@ CREATE TABLE IF NOT EXISTS quotes
 )
 ENGINE = MergeTree()
 PARTITION BY (source, toYYYYMM(time))
-ORDER BY (source, timeframe, time)
+ORDER BY (source, symbol, timeframe, time)
 SETTINGS index_granularity = 8192;
 
 CREATE VIEW IF NOT EXISTS quotes_view AS
 SELECT
     source,
+    symbol,
     timeframe,
     time,
     open,
