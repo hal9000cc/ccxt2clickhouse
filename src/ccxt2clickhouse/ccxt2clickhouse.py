@@ -14,14 +14,15 @@ import time
 import asyncio
 from pathlib import Path
 from typing import Optional, List, Dict
-from datetime import datetime
+from datetime import datetime, UTC
 from dotenv import load_dotenv
 import clickhouse_connect
 import numpy as np
 import ccxt
 from timeframe import Timeframe
-from constants import TIME_TYPE_UNIT
+from constants import TIME_TYPE_UNIT, TIME_UNITS_IN_ONE_SECOND
 
+MAX_FETCH_BARS = 1000
 
 def setup_logging(log_file: str = '/var/log/ccxt2clickhouse.log'):
     """
@@ -36,6 +37,9 @@ def setup_logging(log_file: str = '/var/log/ccxt2clickhouse.log'):
     # Create root logger
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)
+    
+    # Set ccxt library logging level to WARNING to reduce noise
+    logging.getLogger('ccxt').setLevel(logging.WARNING)
     
     # Custom formatter to use short level names
     class ShortLevelFormatter(logging.Formatter):
@@ -65,7 +69,7 @@ def setup_logging(log_file: str = '/var/log/ccxt2clickhouse.log'):
     
     # 1. Console handler - INFO and above
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(logging.DEBUG)
     console_handler.setFormatter(console_format)
     root_logger.addHandler(console_handler)
     
@@ -121,13 +125,13 @@ logger = logging.getLogger(__name__)
 
 def env_symbol_param(symbol_entry: str) -> Dict[str, any]:
     """
-    Parse a single SYMBOLS entry: exchange:symbol[:start_date]
+    Parse a single SYMBOLS entry: exchange:symbol[:start_time]
     
     Args:
         symbol_entry: Single symbol entry string (e.g., "binance:BTC/USDT:2024-01-01")
         
     Returns:
-        Dictionary with keys: exchange, symbol, start_date
+        Dictionary with keys: exchange, symbol, start_time
         
     Raises:
         ValueError: If entry format is invalid or required fields are empty
@@ -158,7 +162,7 @@ def env_symbol_param(symbol_entry: str) -> Dict[str, any]:
     return {
         'exchange': exchange,
         'symbol': symbol,
-        'start_date': start_date
+        'start_time': start_date
     }
 
 
@@ -166,7 +170,7 @@ def env_symbol_params() -> Optional[List[Dict[str, any]]]:
     """
     Parse SYMBOLS and TIMEFRAMES environment variables and create symbol_params array.
     
-    SYMBOLS format: exchange:symbol:start_date (comma-separated)
+    SYMBOLS format: exchange:symbol:start_time (comma-separated)
     Example: binance:BTC/USDT:2024-01-01,bybit:ETH/USDT:2024-01-01
     
     TIMEFRAMES format: comma-separated timeframe strings
@@ -189,7 +193,7 @@ def env_symbol_params() -> Optional[List[Dict[str, any]]]:
             logger.error("TIMEFRAMES environment variable is not set or empty")
             return None
         
-        # Parse symbols: exchange:symbol:start_date
+        # Parse symbols: exchange:symbol:start_time
         try:
             symbol_params_list = [env_symbol_param(s.strip()) for s in symbols_str.split(',') if s.strip()]
         except ValueError as e:
@@ -214,7 +218,7 @@ def env_symbol_params() -> Optional[List[Dict[str, any]]]:
                 'exchange': sp['exchange'],
                 'symbol': sp['symbol'],
                 'timeframe': tf,
-                'start_date': sp['start_date']
+                'start_time': sp['start_time']
             }
             for sp in symbol_params_list
             for tf in timeframes
@@ -459,8 +463,7 @@ class CCXT2ClickHouseDaemon:
                 raise
         
         # Add exchange_client reference to each symbol_param
-        for param in symbol_params:
-            param['exchange_client'] = exchange_clients[param['exchange']]
+        [param.update({'exchange_client': exchange_clients[param['exchange']]}) for param in symbol_params]
     
     def wait_next_bar(self, timeframes: List[Timeframe], next_bar_times: Dict[Timeframe, int], bar_delay: int) -> List[Timeframe]:
         """
@@ -475,35 +478,40 @@ class CCXT2ClickHouseDaemon:
         Returns:
             List of timeframes that are ready (their bar time has arrived)
         """
-        now_dt = datetime.now()
-        now_units = int(now_dt.timestamp() * 1000)
-        now = np.datetime64(now_units, TIME_TYPE_UNIT)
+        now_dt = datetime.now(UTC)
+        now_ms = int(now_dt.timestamp() * 1000)
+        now = np.datetime64(now_ms, TIME_TYPE_UNIT)
         
         for tf in timeframes:
             if tf not in next_bar_times:
                 current_bar_start = tf.begin_of_tf(now)
                 current_bar_start_units = int(current_bar_start.astype(np.int64))
-                bar_delay_units = bar_delay * 1000
+                bar_delay_units = bar_delay * TIME_UNITS_IN_ONE_SECOND
                 next_bar_start_units = current_bar_start_units + tf.value + bar_delay_units
                 next_bar_times[tf] = next_bar_start_units
             else:
+                now_units = int(now.astype(np.int64))
                 if now_units >= next_bar_times[tf]:
                     current_bar_start = tf.begin_of_tf(now)
                     current_bar_start_units = int(current_bar_start.astype(np.int64))
-                    bar_delay_units = bar_delay * 1000
+                    bar_delay_units = bar_delay * TIME_UNITS_IN_ONE_SECOND
                     next_bar_start_units = current_bar_start_units + tf.value + bar_delay_units
                     next_bar_times[tf] = next_bar_start_units
         
         min_next_time = min(next_bar_times.values())
+        now_units = int(now.astype(np.int64))
         sleep_units = max(0, min_next_time - now_units)
+        sleep_ms = sleep_units * 1000 / TIME_UNITS_IN_ONE_SECOND
         
-        if sleep_units > 0:
-            sleep_s = sleep_units / 1000.0
+        if sleep_ms > 0:
+            sleep_s = sleep_ms / 1000.0
             logger.debug(f"Sleeping {sleep_s:.2f}s until next bar (timeframes: {[str(tf) for tf in timeframes]})")
             time.sleep(sleep_s)
         
-        now_dt = datetime.now()
-        now_units = int(now_dt.timestamp() * 1000)
+        now_dt = datetime.now(UTC)
+        now_ms = int(now_dt.timestamp() * 1000)
+        now = np.datetime64(now_ms, TIME_TYPE_UNIT)
+        now_units = int(now.astype(np.int64))
         ready_timeframes = [
             tf for tf in timeframes
             if now_units >= next_bar_times[tf]
@@ -511,9 +519,9 @@ class CCXT2ClickHouseDaemon:
         
         return ready_timeframes
     
-    async def fetch_candle_async(self, exchange: ccxt.Exchange, exchange_name: str, symbol: str, tf: Timeframe, since: datetime, until: Optional[datetime] = None, max_bars: int = 1000, retry_delay: int = 1) -> List[tuple]:
+    async def fetch_bar_async(self, exchange: ccxt.Exchange, exchange_name: str, symbol: str, tf: Timeframe, since: datetime, realtime: bool = False, max_bars: int = 1000, retry_delay: int = 1) -> tuple:
         """
-        Asynchronously fetch candles from exchange
+        Asynchronously fetch bars from exchange
         
         Args:
             exchange: CCXT exchange instance
@@ -521,21 +529,21 @@ class CCXT2ClickHouseDaemon:
             symbol: Trading pair symbol
             tf: Timeframe object
             since: Start time as datetime
-            until: End time as datetime (optional, for realtime - time of next incomplete bar)
+            realtime: If True, realtime mode - retry until we get a new bar
             max_bars: Maximum number of bars per request
-            retry_delay: Delay in seconds before retry if until bar is not found (default: 1)
+            retry_delay: Delay in seconds before retry in realtime mode (default: 1)
             
         Returns:
-            List of tuples (exchange_name, symbol, tf, candle) for successfully fetched candles
-            candle is [timestamp, open, high, low, close, volume]
+            Tuple (exchange_name, symbol, tf, bars) where:
+            - In historical mode: bars is empty list (bars are saved during fetch)
+            - In realtime mode: bars contains only the last complete bar [timestamp, open, high, low, close, volume]
         """
         tf_str = str(tf)
         current_since = int(since.timestamp() * 1000)
-        until_ms = int(until.timestamp() * 1000) if until else None
-        all_candles = []
+        prev_bars = []
         
         while True:
-            candles = await asyncio.to_thread(
+            bars = await asyncio.to_thread(
                 exchange.fetch_ohlcv,
                 symbol=symbol,
                 timeframe=tf_str,
@@ -543,43 +551,55 @@ class CCXT2ClickHouseDaemon:
                 limit=max_bars
             )
             
-            if not candles or len(candles) == 0:
-                break
-            
-            fetched_candles = [(exchange_name, symbol, tf, candle) for candle in candles]
-            
-            if fetched_candles:
-                self.save_bars(fetched_candles)
-                all_candles.extend(fetched_candles)
-            
-            if until_ms:
-                if not fetched_candles:
+            if not bars or len(bars) == 0:
+                if realtime:
                     await asyncio.sleep(retry_delay)
                     continue
-                last_candle_time = fetched_candles[-1][3][0]
-                if last_candle_time < until_ms:
-                    await asyncio.sleep(retry_delay)
-                    continue
-                if last_candle_time > until_ms:
-                    raise ValueError(f"Unexpected bar time {last_candle_time} > until {until_ms} for {exchange_name}/{symbol}/{tf_str}")
-            
-            if len(candles) < max_bars:
+
+                if prev_bars:
+                    del prev_bars[-1]
+                    if prev_bars:
+                        self.save_bars(exchange_name, symbol, tf, prev_bars)
+                    else:
+                        await asyncio.sleep(retry_delay)
+                        continue
+
                 break
             
-            last_candle_time = candles[-1][0]
-            if last_candle_time <= current_since:
-                break
+            bars_count = len(bars)
             
-            if until_ms and last_candle_time >= until_ms:
-                break
-            
-            current_since = last_candle_time + 1
+            if bars_count == max_bars:
+
+                if realtime:
+                    raise ValueError(f"Unexpected: received max_bars ({max_bars}) bars in realtime mode for {exchange_name}/{symbol}/{tf_str}. This indicates too much data was fetched.")
+                # Not the last batch - process prev_bars and save current batch to prev_bars
+                if prev_bars:
+                    self.save_bars(exchange_name, symbol, tf, prev_bars)
+                prev_bars = bars
+                # Continue to next batch
+                last_bar_time = bars[-1][0]
+                current_since = last_bar_time + 1
+            else:
+                # Last batch - add to prev_bars, remove last incomplete bar, process and return
+                prev_bars.extend(bars)
+                del prev_bars[-1]
+                
+                if prev_bars:
+                    self.save_bars(exchange_name, symbol, tf, prev_bars)
+                    
+                    if realtime:
+                        logger.debug(f"Realtime mode: returning {len(prev_bars)} complete bars for {exchange_name}/{symbol}/{tf_str}, last bar time: {datetime.fromtimestamp(prev_bars[-1][0] / 1000.0, UTC).strftime('%Y-%m-%d %H:%M:%S')}")
+                        return exchange_name, symbol, tf, prev_bars
+                
+                # Historical mode or no bars - return empty
+                return exchange_name, symbol, tf, []
         
-        return all_candles
+        # Historical mode: all bars are saved, return empty list
+        return exchange_name, symbol, tf, []
     
     async def fetch_bars_batch(self, symbol_params: List[Dict[str, any]], ready_timeframes: List[Timeframe], now: np.datetime64) -> List[tuple]:
         """
-        Asynchronously fetch candles for symbol_params that match ready_timeframes
+        Asynchronously fetch bars for symbol_params that match ready_timeframes
         
         Args:
             symbol_params: List of dictionaries with keys: exchange, symbol, timeframe, exchange_client
@@ -587,93 +607,109 @@ class CCXT2ClickHouseDaemon:
             now: Current time as numpy datetime64
             
         Returns:
-            List of tuples (exchange_name, symbol, tf, candle) for successfully fetched candles
+            List of tuples (exchange_name, symbol, tf, bar) for successfully fetched bars
         """
         tasks = []
         for param in symbol_params:
             if param['timeframe'] in ready_timeframes:
                 tf = param['timeframe']
-                current_bar_start = tf.begin_of_tf(now)
-                previous_bar_start_units = int(current_bar_start.astype(np.int64)) - tf.value
-                previous_bar_start_dt = datetime.fromtimestamp(previous_bar_start_units / 1000.0)
-                next_bar_start_units = int(current_bar_start.astype(np.int64)) + tf.value
-                next_bar_start_dt = datetime.fromtimestamp(next_bar_start_units / 1000.0)
+                # Get last saved time and calculate next bar start
+                last_time = param.get('last_time')
+                if last_time is not None:
+                    if isinstance(last_time, datetime):
+                        last_time_units = int(np.datetime64(int(last_time.timestamp() * 1000), TIME_TYPE_UNIT).astype(np.int64))
+                    else:
+                        last_time_units = last_time
+                    min_bar_start_units = last_time_units + tf.value
+                    since_dt = datetime.fromtimestamp(min_bar_start_units / TIME_UNITS_IN_ONE_SECOND, UTC)
+                else:
+                    # No saved data, start from start_time or skip
+                    if param.get('start_time'):
+                        start_time = datetime.strptime(param['start_time'], '%Y-%m-%d').replace(tzinfo=UTC)
+                        fetch_datetime64 = np.datetime64(int(start_time.timestamp() * 1000), TIME_TYPE_UNIT)
+                        min_bar_start = tf.begin_of_tf(fetch_datetime64)
+                        since_dt = datetime.fromtimestamp(int(min_bar_start.astype(np.int64)) / TIME_UNITS_IN_ONE_SECOND, UTC)
+                    else:
+                        continue
                 
-                tasks.append(self.fetch_candle_async(
+                tasks.append(self.fetch_bar_async(
                     param['exchange_client'],
                     param['exchange'],
                     param['symbol'],
                     tf,
-                    previous_bar_start_dt,
-                    next_bar_start_dt,
-                    2,
-                    1
+                    since_dt,
+                    realtime=True,
+                    max_bars=MAX_FETCH_BARS,
+                    retry_delay=1
                 ))
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        fetched_candles = []
-        now_dt = datetime.now()
-        now_units = int(now_dt.timestamp() * 1000)
+        fetched_bars = []
+        task_params = [p for p in symbol_params if p['timeframe'] in ready_timeframes]
         
-        for result in results:
+        for result, param in zip(results, task_params):
             if isinstance(result, Exception):
                 logger.error(f"Exception in async fetch: {result}", exc_info=True)
-            elif isinstance(result, list) and result:
-                for candle_tuple in result:
-                    exchange_name, symbol, tf, candle = candle_tuple
-                    candle_time = candle[0]
-                    current_bar_start = tf.begin_of_tf(np.datetime64(now_units, TIME_TYPE_UNIT))
-                    current_bar_start_units = int(current_bar_start.astype(np.int64))
-                    if candle_time < current_bar_start_units:
-                        fetched_candles.append(candle_tuple)
+            elif isinstance(result, tuple):
+                exchange_name, symbol, tf, bars = result
+                if bars:
+                    # Update last_time to last bar time
+                    last_bar_time = bars[-1][0]
+                    last_bar_dt = datetime.fromtimestamp(last_bar_time / 1000.0, UTC)
+                    param['last_time'] = last_bar_dt
+                    
+                    for bar in bars:
+                        fetched_bars.append((exchange_name, symbol, tf, bar))
         
-        return fetched_candles
+        return fetched_bars
     
     def fetch_bars_historical(self, symbol_params: List[Dict[str, any]]):
-        max_bars = 1000
         
         if not symbol_params:
             return
         
         self.get_last_bar_times(symbol_params)
         
-        now_dt = datetime.now()
-        now_units = int(now_dt.timestamp() * 1000)
-        now = np.datetime64(now_units, TIME_TYPE_UNIT)
+        now_dt = datetime.now(UTC)
+        now_ms = int(now_dt.timestamp() * 1000)
+        now = np.datetime64(now_ms, TIME_TYPE_UNIT)
         
         tasks = []
         for param in symbol_params:
             last_time = param.get('last_time')
             
             if last_time is not None:
-                last_time_ms = int(last_time.timestamp() * 1000) if isinstance(last_time, datetime) else last_time
-                min_bar_start_dt = datetime.fromtimestamp((last_time_ms + param['timeframe'].value) / 1000.0)
+                if isinstance(last_time, datetime):
+                    last_time_units = int(np.datetime64(int(last_time.timestamp() * 1000), TIME_TYPE_UNIT).astype(np.int64))
+                else:
+                    last_time_units = last_time
+                min_bar_start_units = last_time_units + param['timeframe'].value
+                min_bar_start_dt = datetime.fromtimestamp(min_bar_start_units / TIME_UNITS_IN_ONE_SECOND, UTC)
             else:
-                if param['start_date']:
-                    start_date = datetime.strptime(param['start_date'], '%Y-%m-%d')
-                    start_datetime64 = np.datetime64(int(start_date.timestamp() * 1000), TIME_TYPE_UNIT)
-                    min_bar_start = param['timeframe'].begin_of_tf(start_datetime64)
-                    min_bar_start_dt = datetime.fromtimestamp(int(min_bar_start.astype(np.int64)) / 1000.0)
+                if param['start_time']:
+                    start_time = datetime.strptime(param['start_time'], '%Y-%m-%d').replace(tzinfo=UTC)
+                    fetch_datetime64 = np.datetime64(int(start_time.timestamp() * 1000), TIME_TYPE_UNIT)
+                    min_bar_start = param['timeframe'].begin_of_tf(fetch_datetime64)
+                    min_bar_start_dt = datetime.fromtimestamp(int(min_bar_start.astype(np.int64)) / TIME_UNITS_IN_ONE_SECOND, UTC)
                 else:
                     continue
             
             max_bar_start = param['timeframe'].begin_of_tf(now)
-            max_bar_start_dt = datetime.fromtimestamp(int(max_bar_start.astype(np.int64)) / 1000.0)
+            max_bar_start_dt = datetime.fromtimestamp(int(max_bar_start.astype(np.int64)) / TIME_UNITS_IN_ONE_SECOND, UTC)
             
             if min_bar_start_dt >= max_bar_start_dt:
                 continue
             
-            task = self.fetch_candle_async(
+            tasks.append(self.fetch_bar_async(
                 param['exchange_client'],
                 param['exchange'],
                 param['symbol'],
                 param['timeframe'],
                 min_bar_start_dt,
-                None,
-                max_bars
-            )
-            tasks.append(task)
+                realtime=False,
+                max_bars=MAX_FETCH_BARS
+            ))
         
         if not tasks:
             return
@@ -683,13 +719,12 @@ class CCXT2ClickHouseDaemon:
         
         all_fetched = asyncio.run(fetch_all())
         
-        fetched_candles = []
         for result in all_fetched:
             if isinstance(result, Exception):
                 logger.error(f"Exception in historical fetch: {result}", exc_info=True)
-            elif isinstance(result, list) and result:
-                if len(result) > 0:
-                    fetched_candles.extend(result[:-1])
+            elif isinstance(result, tuple):
+                exchange_name, symbol, tf, bars = result
+                # Bars are already saved in fetch_bar_async, no need to save again
     
     def get_last_bar_times(self, symbol_params: List[Dict[str, any]]):
         if not symbol_params:
@@ -714,10 +749,10 @@ class CCXT2ClickHouseDaemon:
             self.clickhouse_client.insert(temp_table, data, column_names=['source', 'symbol', 'timeframe'])
             
             query = f"""
-                SELECT t.source, t.symbol, t.timeframe, MAX(q.time) as last_time
+                SELECT t.source, t.symbol, t.timeframe, 
+                       (SELECT toTimeZone(MAX(time), 'UTC') FROM quotes q 
+                        WHERE q.source = t.source AND q.symbol = t.symbol AND q.timeframe = t.timeframe) as last_time
                 FROM {temp_table} t
-                LEFT JOIN quotes q ON t.source = q.source AND t.symbol = q.symbol AND t.timeframe = q.timeframe
-                GROUP BY t.source, t.symbol, t.timeframe
             """
             
             result = self.clickhouse_client.query(query)
@@ -726,6 +761,7 @@ class CCXT2ClickHouseDaemon:
             for row in result.result_rows:
                 source, symbol, timeframe_str, last_time = row
                 key = (source, symbol, timeframe_str)
+                last_time = None if last_time is None else last_time.replace(tzinfo=UTC)
                 last_times_map[key] = last_time
             
             for param in symbol_params:
@@ -737,42 +773,122 @@ class CCXT2ClickHouseDaemon:
             for param in symbol_params:
                 param['last_time'] = None
     
-    def save_bars(self, candles: List[tuple]):
-        pass
-    
-    def save_candles_to_db(self, candles: List[tuple]):
-        if not candles:
+    def save_bars(self, exchange_name: str, symbol: str, tf: Timeframe, bars: List[list], check_data: bool = True):
+        """
+        Save bars to database
+        
+        Args:
+            exchange_name: Name of the exchange
+            symbol: Trading pair symbol
+            tf: Timeframe object
+            bars: List of bars [timestamp, open, high, low, close, volume]
+            check_data: If True, check for duplicates and gaps, raise exception if found (default: True)
+        """
+        if not bars:
             return
         
-        data = []
-        for exchange_name, symbol, tf, candle in candles:
-            data.append([
-                exchange_name,
-                symbol,
-                str(tf),
-                datetime.fromtimestamp(candle[0] / 1000.0),
-                candle[1],
-                candle[2],
-                candle[3],
-                candle[4],
-                candle[5]
-            ])
+        temp_table = 'temp_save_bars'
+        tf_str = str(tf)
         
         try:
+            # Create temporary Memory table
+            # Store timestamp as Int64 (milliseconds) for easier handling
+            self.clickhouse_client.command(f"""
+                CREATE TABLE IF NOT EXISTS {temp_table}
+                (
+                    source String,
+                    symbol String,
+                    timeframe String,
+                    time DateTime64(3, 'UTC'),
+                    open Float64,
+                    high Float64,
+                    low Float64,
+                    close Float64,
+                    volume Float64
+                )
+                ENGINE = Memory
+            """)
+            
+            self.clickhouse_client.command(f"TRUNCATE TABLE {temp_table}")
+            
+            # Prepare data
+            data = []
+            for bar in bars:
+                data.append([
+                    exchange_name,
+                    symbol,
+                    tf_str,
+                    bar[0],
+                    bar[1],
+                    bar[2],
+                    bar[3],
+                    bar[4],
+                    bar[5]
+                ])
+            
+            # Insert into temp table
             self.clickhouse_client.insert(
-                'quotes',
+                temp_table,
                 data,
                 column_names=['source', 'symbol', 'timeframe', 'time', 'open', 'high', 'low', 'close', 'volume']
             )
-            logger.info(f"Saved {len(candles)} candles to database")
+            
+            # Check for duplicates and gaps if requested
+            if check_data:
+                first_bar_time = datetime.fromtimestamp(bars[0][0] / 1000.0, UTC)
+                
+                # Single query to check duplicates and get last time
+                query = f"""
+                    SELECT 
+                        (SELECT COUNT(*) FROM {temp_table} t
+                         INNER JOIN quotes q ON t.source = q.source 
+                             AND t.symbol = q.symbol 
+                             AND t.timeframe = q.timeframe 
+                             AND t.time = q.time) as duplicate_count,
+                        (SELECT MAX(time) FROM quotes
+                         WHERE source = '{exchange_name.replace("'", "''")}' 
+                           AND symbol = '{symbol.replace("'", "''")}' 
+                           AND timeframe = '{tf_str.replace("'", "''")}') as last_time
+                """
+                result = self.clickhouse_client.query(query)
+                
+                if result.result_rows:
+                    duplicate_count = result.result_rows[0][0] or 0
+                    last_time = result.result_rows[0][1].replace(tzinfo=UTC)
+                    
+                    if duplicate_count > 0:
+                        raise ValueError(f"Found {duplicate_count} duplicate bars for {exchange_name}/{symbol}/{tf_str}")
+                    
+                    # Check for gaps only if we have existing data (last_time is not None and not default 1970)
+                    if last_time and last_time.year > 1970:
+                        expected_next_time = last_time + tf.timedelta()
+                        if first_bar_time != expected_next_time:
+                            raise ValueError(
+                                f"Data gap detected for {exchange_name}/{symbol}/{tf_str}: "
+                                f"last time in DB: {last_time}, expected next: {expected_next_time}, "
+                                f"got: {first_bar_time}"
+                            )
+            
+            # Insert from temp table to main table
+            # Convert timestamp (milliseconds) to DateTime64 with UTC timezone
+            self.clickhouse_client.command(f"""
+                INSERT INTO quotes
+                SELECT source, symbol, timeframe, time, open, high, low, close, volume
+                FROM {temp_table}
+            """)
+            
+            self.clickhouse_client.command(f"TRUNCATE TABLE {temp_table}")
+            logger.info(f"Saved {len(bars)} bars to database ({exchange_name}/{symbol}/{tf_str})")
+            
         except Exception as e:
-            logger.error(f"Error saving candles to database: {e}", exc_info=True)
-
+            logger.error(f"Error saving bars to database: {e}", exc_info=True)
+            raise
+    
     def fetch_bars_realtime(self, symbol_params: List[Dict[str, any]], bar_delay: int):
         """
         Main work procedure - fetch quotes and write to ClickHouse
         
-        Synchronizes requests to fetch candles exactly when new bars appear.
+        Synchronizes requests to fetch bars exactly when new bars appear.
         For each timeframe, calculates the time of the next bar and waits until that moment.
         After bar time arrives, waits additional bar_delay seconds for exchange to finalize the bar.
         
@@ -780,7 +896,9 @@ class CCXT2ClickHouseDaemon:
             symbol_params: List of dictionaries with keys: exchange, symbol, timeframe
             bar_delay: Additional delay in seconds after bar time to wait for exchange to finalize the bar
         """
-
+        # Get last saved bar times from database
+        self.get_last_bar_times(symbol_params)
+        
         timeframes = list({param['timeframe'] for param in symbol_params})
         
         next_bar_times: Dict[Timeframe, int] = {}
@@ -792,26 +910,25 @@ class CCXT2ClickHouseDaemon:
                 if not ready_timeframes:
                     continue
                 
-                now_dt = datetime.now()
-                now_units = int(now_dt.timestamp() * 1000)
-                now = np.datetime64(now_units, TIME_TYPE_UNIT)
+                now_dt = datetime.now(UTC)
+                now_ms = int(now_dt.timestamp() * 1000)
+                now = np.datetime64(now_ms, TIME_TYPE_UNIT)
                 
-                fetched_candles = asyncio.run(
+                fetched_bars = asyncio.run(
                     self.fetch_bars_batch(symbol_params, ready_timeframes, now)
                 )
                 
-                for exchange_name, symbol, tf, candle in fetched_candles:
+                for exchange_name, symbol, tf, bar in fetched_bars:
                     tf_str = str(tf)
                     logger.info(
                         f"Fetched {exchange_name}/{symbol}/{tf_str}: "
-                        f"time={candle[0]}, close={candle[4]}, volume={candle[5]}"
+                        f"time={bar[0]}, close={bar[4]}, volume={bar[5]}"
                     )
-                    # TODO: Save to ClickHouse
                 
                 for tf in ready_timeframes:
                     current_bar_start = tf.begin_of_tf(now)
                     current_bar_start_units = int(current_bar_start.astype(np.int64))
-                    bar_delay_units = bar_delay * 1000
+                    bar_delay_units = bar_delay * TIME_UNITS_IN_ONE_SECOND
                     next_bar_start_units = current_bar_start_units + tf.value + bar_delay_units
                     next_bar_times[tf] = next_bar_start_units
                     

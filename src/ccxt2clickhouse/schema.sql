@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS quotes
     source LowCardinality(String) COMMENT 'Exchange name (binance, bybit, etc.)',
     symbol LowCardinality(String) COMMENT 'Trading pair symbol (BTC/USDT, ETH/USDT, etc.)',
     timeframe LowCardinality(String) COMMENT 'Timeframe: 1s, 1m, 5m, 1h, 1d, 1w, etc.',
-    time DateTime64(3) COMMENT 'Timestamp in milliseconds precision',
+    time DateTime64(3, 'UTC') COMMENT 'Timestamp in milliseconds precision',
     open Float64 COMMENT 'Opening price',
     high Float64 COMMENT 'Highest price',
     low Float64 COMMENT 'Lowest price',
