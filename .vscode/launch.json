@@ -1,0 +1,33 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: ccxt2clickhouse (module)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "ccxt2clickhouse",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/venv/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            },
+            "justMyCode": true
+        },
+        {
+            "name": "Python: ccxt2clickhouse (with args)",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "ccxt2clickhouse",
+            "args": ["--config", "${workspaceFolder}/.env"],
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "python": "${workspaceFolder}/venv/bin/python",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            },
+            "justMyCode": true
+        }
+    ]
+}
+

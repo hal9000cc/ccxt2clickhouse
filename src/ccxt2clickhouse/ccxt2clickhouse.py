@@ -19,8 +19,8 @@ from dotenv import load_dotenv
 import clickhouse_connect
 import numpy as np
 import ccxt
-from timeframe import Timeframe
-from constants import TIME_TYPE_UNIT, TIME_UNITS_IN_ONE_SECOND
+from .timeframe import Timeframe
+from .constants import TIME_TYPE_UNIT, TIME_UNITS_IN_ONE_SECOND
 
 MAX_FETCH_BARS = 1000
 
@@ -36,7 +36,7 @@ def setup_logging(log_file: str = '/var/log/ccxt2clickhouse.log'):
     """
     # Create root logger
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)
+    root_logger.setLevel(logging.INFO)
     
     # Set ccxt library logging level to WARNING to reduce noise
     logging.getLogger('ccxt').setLevel(logging.WARNING)
@@ -257,6 +257,23 @@ class CCXT2ClickHouseDaemon:
         
         logger.info("CCXT2ClickHouse daemon initialized")
     
+    def interruptible_sleep(self, duration: float, check_interval: float = 3.0):
+        """
+        Sleep with periodic checks for self.running flag to allow graceful shutdown
+        
+        Args:
+            duration: Total sleep duration in seconds
+            check_interval: Interval between checks in seconds (default: 3.0)
+        """
+        start_time = time.monotonic()
+        while self.running:
+            elapsed = time.monotonic() - start_time
+            if elapsed >= duration:
+                break
+            remaining = duration - elapsed
+            sleep_time = min(check_interval, remaining)
+            time.sleep(sleep_time)
+    
     def find_config(self) -> str:
         """Find .env configuration file"""
         # Search order:
@@ -279,7 +296,7 @@ class CCXT2ClickHouseDaemon:
         
         for path in possible_paths:
             if path.exists():
-                logger.info(f"Using config file: {path}")
+                logger.debug(f"Using config file: {path}")
                 return str(path)
         
         logger.warning("Config file .env not found, using defaults")
@@ -292,7 +309,7 @@ class CCXT2ClickHouseDaemon:
             return
         
         load_dotenv(self.config_path)
-        logger.info(f"Config loaded from {self.config_path}")
+        logger.debug(f"Config loaded from {self.config_path}")
     
     def setup_signal_handlers(self):
         """Setup signal handlers"""
@@ -422,7 +439,7 @@ class CCXT2ClickHouseDaemon:
         except Exception as e:
             logger.error(f"Error in main loop iteration: {e}", exc_info=True)
             if self.running:
-                time.sleep(10)  # Pause before retry on error
+                self.interruptible_sleep(10)  # Pause before retry on error
     
     def init_exchanges(self, symbol_params: List[Dict[str, any]]):
         """
@@ -506,7 +523,7 @@ class CCXT2ClickHouseDaemon:
         if sleep_ms > 0:
             sleep_s = sleep_ms / 1000.0
             logger.debug(f"Sleeping {sleep_s:.2f}s until next bar (timeframes: {[str(tf) for tf in timeframes]})")
-            time.sleep(sleep_s)
+            self.interruptible_sleep(sleep_s)
         
         now_dt = datetime.now(UTC)
         now_ms = int(now_dt.timestamp() * 1000)
@@ -730,7 +747,7 @@ class CCXT2ClickHouseDaemon:
         if not symbol_params:
             return
         
-        temp_table = 'temp_symbol_params'
+        temp_table = 'ccxt2clickhouse_temp_symbol_params'
         
         try:
             self.clickhouse_client.command(f"""
@@ -787,7 +804,7 @@ class CCXT2ClickHouseDaemon:
         if not bars:
             return
         
-        temp_table = 'temp_save_bars'
+        temp_table = 'ccxt2clickhouse_temp_save_bars'
         tf_str = str(tf)
         
         try:
@@ -976,11 +993,11 @@ class SystemdServiceManager:
     def create_service_file(cls) -> str:
         """Create systemd unit file content"""
         python_path = cls.get_venv_python()
-        # Use entry point command instead of direct script path
-        script_path = "ccxt2clickhouse-daemon"
         # Find project root for working directory
         package_dir = Path(__file__).parent
         work_dir = package_dir.parent.parent
+        # Use full path to the command in venv
+        script_path = str(work_dir / "venv" / "bin" / "ccxt2clickhouse-daemon")
         
         # Determine service user
         # If running from root, use current user or create a dedicated one
@@ -993,7 +1010,7 @@ After=network.target
 [Service]
 Type=simple
 User={service_user}
-WorkingDirectory={work_dir}
+WorkingDirectory={str(work_dir)}
 ExecStart={script_path}
 ExecStop=/bin/kill -TERM $MAINPID
 Restart=always

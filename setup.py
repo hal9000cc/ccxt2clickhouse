@@ -35,7 +35,7 @@ setup(
     install_requires=requirements,
     entry_points={
         "console_scripts": [
-            "ccxt2clickhouse-daemon=ccxt2clickhouse.daemon:main",
+            "ccxt2clickhouse-daemon=ccxt2clickhouse.ccxt2clickhouse:main",
         ],
     },
     classifiers=[

@@ -1,8 +1,8 @@
 from enum import IntEnum
 import numpy as np
 import datetime as dt
-from constants import TIME_TYPE, TIME_TYPE_UNIT, TIME_UNITS_IN_ONE_SECOND, TIME_UNITS_NAME_FOR_TIMEDELTA, TIME_UNITS_IN_ONE_DAY
-from exceptions import C2CExceptionBadTimeframeValue
+from .constants import TIME_TYPE, TIME_TYPE_UNIT, TIME_UNITS_IN_ONE_SECOND, TIME_UNITS_NAME_FOR_TIMEDELTA, TIME_UNITS_IN_ONE_DAY
+from .exceptions import C2CExceptionBadTimeframeValue
 
 
 class Timeframe(IntEnum):
